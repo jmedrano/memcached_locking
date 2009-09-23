@@ -117,9 +117,9 @@ void stats_prefix_record_get(const char *key, const size_t nkey, const bool is_h
     STATS_LOCK();
     pfs = stats_prefix_find(key, nkey);
     if (NULL != pfs) {
-        pfs->num_gets++;
+        atomic_inc(&pfs->num_gets);
         if (is_hit) {
-            pfs->num_hits++;
+            atomic_inc(&pfs->num_hits);
         }
     }
     STATS_UNLOCK();
@@ -134,7 +134,7 @@ void stats_prefix_record_delete(const char *key, const size_t nkey) {
     STATS_LOCK();
     pfs = stats_prefix_find(key, nkey);
     if (NULL != pfs) {
-        pfs->num_deletes++;
+        atomic_inc(&pfs->num_deletes);
     }
     STATS_UNLOCK();
 }
@@ -148,7 +148,7 @@ void stats_prefix_record_set(const char *key, const size_t nkey) {
     STATS_LOCK();
     pfs = stats_prefix_find(key, nkey);
     if (NULL != pfs) {
-        pfs->num_sets++;
+        atomic_inc(&pfs->num_sets);
     }
     STATS_UNLOCK();
 }

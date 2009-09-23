@@ -16,7 +16,12 @@ memcached_SOURCES = memcached.c memcached.h \
                     thread.c daemon.c \
                     stats.c stats.h \
                     util.c util.h \
-                    trace.h cache.h
+                    trace.h cache.h \
+                    atomic.h
+
+if BUILD_ATOMIC
+memcached_SOURCES += atomic.c
+endif
 
 if BUILD_CACHE
 memcached_SOURCES += cache.c

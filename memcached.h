@@ -21,6 +21,7 @@
 
 #include "protocol_binary.h"
 #include "cache.h"
+#include "atomic.h"
 
 /** Maximum length of a key. */
 #define KEY_MAX_LENGTH 250
@@ -451,7 +452,7 @@ void  item_flush_expired(void);
 item *item_get(const char *key, const size_t nkey);
 int   item_link(item *it);
 void  item_remove(item *it);
-int   item_replace(item *it, item *new_it);
+int   item_replace(item *it, item *new_it, int force);
 void  item_stats(ADD_STAT add_stats, void *c);
 void  item_stats_sizes(ADD_STAT add_stats, void *c);
 void  item_unlink(item *it);

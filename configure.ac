@@ -320,6 +320,67 @@ fi
 
 AC_C_ALIGNMENT
 
+AC_DEFUN([AC_C_SYNC_BUILTINS],
+[AC_CACHE_CHECK(for __sync_xxx builtins, ac_cv_c_sync_builtins,
+[
+  AC_RUN_IFELSE(
+    [AC_LANG_PROGRAM([],
+[
+int i=0;
+long l=0;
+unsigned int ui=0;
+unsigned long ul=0;
+__sync_add_and_fetch(&i, 10);
+__sync_add_and_fetch(&l, 10);
+__sync_add_and_fetch(&ui, 10);
+__sync_add_and_fetch(&ul, 10);
+__sync_val_compare_and_swap(&i, 10, 1);
+__sync_val_compare_and_swap(&l, 10, 1);
+__sync_val_compare_and_swap(&ui, 10, 1);
+__sync_val_compare_and_swap(&ul, 10, 1);
+return (i + l + ui + ul) != 4;
+])
+  ],[
+   ac_cv_c_sync_builtins=yes
+  ],[
+   ac_cv_c_sync_builtins=no
+  ])
+])
+if test $ac_cv_c_sync_builtins = yes; then
+  AC_DEFINE(HAVE_SYNC_BUILTINS, 1, [compiler understands __sync_xxx builtins])
+else
+  AC_MSG_ERROR([There is no support for __sync_add_and_fetch builtins in your compiler. Please use gcc or icc to compile.])
+fi
+])
+
+AC_C_SYNC_BUILTINS
+
+AC_DEFUN([AC_C_SYNC_BUILTINS_64],
+[AC_CACHE_CHECK(for 64 bit __sync_xxx builtins, ac_cv_c_sync_builtins_64,
+[
+  AC_RUN_IFELSE(
+    [AC_LANG_PROGRAM([#include <stdint.h>],
+[
+uint64_t u64=0;
+__sync_add_and_fetch(&u64, 10);
+__sync_val_compare_and_swap(&u64, 10, 1);
+return u64 != 1;
+])
+  ],[
+   ac_cv_c_sync_builtins_64=yes
+  ],[
+   ac_cv_c_sync_builtins_64=no
+  ])
+])
+if test $ac_cv_c_sync_builtins_64 = yes; then
+  AC_DEFINE(HAVE_SYNC_BUILTINS_64, 1, [compiler understands 64 bit __sync_xxx builtins])
+fi
+])
+
+AC_C_SYNC_BUILTINS_64
+
+AM_CONDITIONAL([BUILD_ATOMIC],[test "$ac_cv_c_sync_builtins_64" != "yes"])
+
 dnl Check for the requirements for running memcached with less privileges
 dnl than the default privilege set. On Solaris we need setppriv and priv.h
 dnl If you want to add support for other platforms you should check for

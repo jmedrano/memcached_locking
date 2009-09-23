@@ -53,9 +53,11 @@ static void *mem_current = NULL;
 static size_t mem_avail = 0;
 
 /**
- * Access to the slab allocator is protected by this lock
+ * Access to the slab allocator is protected by a lock per slab class and
+ * a global lock
  */
-static pthread_mutex_t slabs_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t slab_lock;
+static pthread_mutex_t slabclass_lock[MAX_NUMBER_OF_SLAB_CLASSES];
 
 /*
  * Forward Declarations
@@ -132,7 +134,9 @@ void slabs_init(const size_t limit, const double factor, const bool prealloc) {
             fprintf(stderr, "slab class %3d: chunk size %6u perslab %5u\n",
                     i, slabclass[i].size, slabclass[i].perslab);
         }
+        pthread_mutex_init(&slabclass_lock[i], NULL);
     }
+    pthread_mutex_init(&slab_lock, NULL);
 
     power_largest = i;
     slabclass[power_largest].size = POWER_BLOCK;
@@ -199,10 +203,12 @@ static int do_slabs_newslab(const unsigned int id) {
 #endif
     char *ptr;
 
+    pthread_mutex_lock(&slab_lock);
     if ((mem_limit && mem_malloced + len > mem_limit && p->slabs > 0) ||
         (grow_slab_list(id) == 0) ||
         ((ptr = memory_allocate((size_t)len)) == 0)) {
 
+        pthread_mutex_unlock(&slab_lock);
         MEMCACHED_SLABS_SLABCLASS_ALLOCATE_FAILED(id);
         return 0;
     }
@@ -213,13 +219,14 @@ static int do_slabs_newslab(const unsigned int id) {
 
     p->slab_list[p->slabs++] = ptr;
     mem_malloced += len;
+    pthread_mutex_unlock(&slab_lock);
     MEMCACHED_SLABS_SLABCLASS_ALLOCATE(id);
 
     return 1;
 }
 
 /*@null@*/
-static void *do_slabs_alloc(const size_t size, unsigned int id) {
+void *slabs_alloc(const size_t size, unsigned int id) {
     slabclass_t *p;
     void *ret = NULL;
 
@@ -232,11 +239,14 @@ static void *do_slabs_alloc(const size_t size, unsigned int id) {
     assert(p->sl_curr == 0 || ((item *)p->slots[p->sl_curr - 1])->slabs_clsid == 0);
 
 #ifdef USE_SYSTEM_MALLOC
+    pthread_mutex_lock(&slab_lock);
     if (mem_limit && mem_malloced + size > mem_limit) {
+        pthread_mutex_unlock(&slab_lock);
         MEMCACHED_SLABS_ALLOCATE_FAILED(size, id);
         return 0;
     }
     mem_malloced += size;
+    pthread_mutex_unlock(&slab_lock);
     ret = malloc(size);
     MEMCACHED_SLABS_ALLOCATE(size, id, 0, ret);
     return ret;
@@ -244,6 +254,7 @@ static void *do_slabs_alloc(const size_t size, unsigned int id) {
 
     /* fail unless we have space at the end of a recently allocated page,
        we have something on our freelist, or we could allocate a new page */
+    pthread_mutex_lock(&slabclass_lock[id]);
     if (! (p->end_page_ptr != 0 || p->sl_curr != 0 ||
            do_slabs_newslab(id) != 0)) {
         /* We don't have more memory available */
@@ -261,6 +272,7 @@ static void *do_slabs_alloc(const size_t size, unsigned int id) {
             p->end_page_ptr = 0;
         }
     }
+    pthread_mutex_unlock(&slabclass_lock[id]);
 
     if (ret) {
         p->requested += size;
@@ -272,7 +284,7 @@ static void *do_slabs_alloc(const size_t size, unsigned int id) {
     return ret;
 }
 
-static void do_slabs_free(void *ptr, const size_t size, unsigned int id) {
+void slabs_free(void *ptr, const size_t size, unsigned int id) {
     slabclass_t *p;
 
     assert(((item *)ptr)->slabs_clsid == 0);
@@ -284,21 +296,27 @@ static void do_slabs_free(void *ptr, const size_t size, unsigned int id) {
     p = &slabclass[id];
 
 #ifdef USE_SYSTEM_MALLOC
+    pthread_mutex_lock(&slab_lock);
     mem_malloced -= size;
+    pthread_mutex_unlock(&slab_lock);
     free(ptr);
     return;
 #endif
 
+    pthread_mutex_lock(&slab_lock);
     if (p->sl_curr == p->sl_total) { /* need more space on the free list */
         int new_size = (p->sl_total != 0) ? p->sl_total * 2 : 16;  /* 16 is arbitrary */
         void **new_slots = realloc(p->slots, new_size * sizeof(void *));
-        if (new_slots == 0)
+        if (new_slots == 0) {
+            pthread_mutex_unlock(&slab_lock);
             return;
+        }
         p->slots = new_slots;
         p->sl_total = new_size;
     }
     p->slots[p->sl_curr++] = ptr;
     p->requested -= size;
+    pthread_mutex_unlock(&slab_lock);
     return;
 }
 
@@ -343,6 +361,7 @@ static void do_slabs_stats(ADD_STAT add_stats, void *c) {
 
     total = 0;
     for(i = POWER_SMALLEST; i <= power_largest; i++) {
+        pthread_mutex_lock(&slabclass_lock[i]);
         slabclass_t *p = &slabclass[i];
         if (p->slabs != 0) {
             uint32_t perslab, slabs;
@@ -380,6 +399,7 @@ static void do_slabs_stats(ADD_STAT add_stats, void *c) {
 
             total++;
         }
+        pthread_mutex_unlock(&slabclass_lock[i]);
     }
 
     /* add overall slab stats and append terminator */
@@ -463,9 +483,18 @@ int do_slabs_reassign(unsigned char srcid, unsigned char dstid) {
 int slabs_reassign(unsigned char srcid, unsigned char dstid) {
     int ret;
 
-    pthread_mutex_lock(&slabs_lock);
+    // avoid deadlock
+    int min_id = srcid;
+    int max_id = dstid;
+    if (min_id > max_id) {
+        min_id = dstid;
+        max_id = srcid;
+    }
+    pthread_mutex_lock(&slabclass_lock[min_id]);
+    pthread_mutex_lock(&slabclass_lock[max_id]);
     ret = do_slabs_reassign(srcid, dstid);
-    pthread_mutex_unlock(&slabs_lock);
+    pthread_mutex_unlock(&slabclass_lock[max_id]);
+    pthread_mutex_unlock(&slabclass_lock[min_id]);
     return ret;
 }
 #endif
@@ -499,23 +528,6 @@ static void *memory_allocate(size_t size) {
     return ret;
 }
 
-void *slabs_alloc(size_t size, unsigned int id) {
-    void *ret;
-
-    pthread_mutex_lock(&slabs_lock);
-    ret = do_slabs_alloc(size, id);
-    pthread_mutex_unlock(&slabs_lock);
-    return ret;
-}
-
-void slabs_free(void *ptr, size_t size, unsigned int id) {
-    pthread_mutex_lock(&slabs_lock);
-    do_slabs_free(ptr, size, id);
-    pthread_mutex_unlock(&slabs_lock);
-}
-
 void slabs_stats(ADD_STAT add_stats, void *c) {
-    pthread_mutex_lock(&slabs_lock);
     do_slabs_stats(add_stats, c);
-    pthread_mutex_unlock(&slabs_lock);
 }

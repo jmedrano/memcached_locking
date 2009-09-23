@@ -122,6 +122,8 @@ static enum transmit_result transmit(conn *c);
 
 #define REALTIME_MAXDELTA 60*60*24*30
 
+static pthread_mutex_t delta_lock = PTHREAD_MUTEX_INITIALIZER;
+
 /*
  * given time value that's either unix time or delta from current unix time, return
  * unix time. Use the fact that delta can't exceed one month (and real time value can't
@@ -358,9 +360,7 @@ conn *conn_new(const int sfd, enum conn_states init_state,
             return NULL;
         }
 
-        STATS_LOCK();
-        stats.conn_structs++;
-        STATS_UNLOCK();
+        atomic_inc(&stats.conn_structs);
     }
 
     c->transport = transport;
@@ -429,10 +429,8 @@ conn *conn_new(const int sfd, enum conn_states init_state,
         return NULL;
     }
 
-    STATS_LOCK();
-    stats.curr_conns++;
-    stats.total_conns++;
-    STATS_UNLOCK();
+    atomic_inc(&stats.curr_conns);
+    atomic_inc(&stats.total_conns);
 
     MEMCACHED_CONN_ALLOCATE(c->sfd);
 
@@ -508,9 +506,7 @@ static void conn_close(conn *c) {
         conn_free(c);
     }
 
-    STATS_LOCK();
-    stats.curr_conns--;
-    STATS_UNLOCK();
+    atomic_dec(&stats.curr_conns);
 
     return;
 }
@@ -1876,9 +1872,9 @@ static void complete_nread(conn *c) {
  *
  * Returns the state of storage.
  */
-enum store_item_type do_store_item(item *it, int comm, conn *c) {
+enum store_item_type store_item(item *it, int comm, conn *c) {
     char *key = ITEM_key(it);
-    item *old_it = do_item_get(key, it->nkey);
+    item *old_it = item_get(key, it->nkey);
     enum store_item_type stored = NOT_STORED;
 
     item *new_it = NULL;
@@ -1886,7 +1882,7 @@ enum store_item_type do_store_item(item *it, int comm, conn *c) {
 
     if (old_it != NULL && comm == NREAD_ADD) {
         /* add only adds a nonexistent item, but promote to head of LRU */
-        do_item_update(old_it);
+        item_update(old_it);
     } else if (!old_it && (comm == NREAD_REPLACE
         || comm == NREAD_APPEND || comm == NREAD_PREPEND))
     {
@@ -1904,12 +1900,25 @@ enum store_item_type do_store_item(item *it, int comm, conn *c) {
             // cas validates
             // it and old_it may belong to different classes.
             // I'm updating the stats for the one that's getting pushed out
-            pthread_mutex_lock(&c->thread->stats.mutex);
-            c->thread->stats.slab_stats[old_it->slabs_clsid].cas_hits++;
-            pthread_mutex_unlock(&c->thread->stats.mutex);
 
-            item_replace(old_it, it);
-            stored = STORED;
+            if (item_replace(old_it, it, 0)) {
+                pthread_mutex_lock(&c->thread->stats.mutex);
+                c->thread->stats.slab_stats[old_it->slabs_clsid].cas_hits++;
+                pthread_mutex_unlock(&c->thread->stats.mutex);
+                stored = STORED;
+            } else {
+                // item has been changed by other thread
+                pthread_mutex_lock(&c->thread->stats.mutex);
+                c->thread->stats.slab_stats[old_it->slabs_clsid].cas_badval++;
+                pthread_mutex_unlock(&c->thread->stats.mutex);
+                stored = EXISTS;
+
+                if(settings.verbose > 1) {
+                    fprintf(stderr, "CAS:  failure: expected %llu, got %llu\n",
+                            (unsigned long long)ITEM_get_cas(old_it),
+                            (unsigned long long)ITEM_get_cas(it));
+                }
+            }
         } else {
             pthread_mutex_lock(&c->thread->stats.mutex);
             c->thread->stats.slab_stats[old_it->slabs_clsid].cas_badval++;
@@ -1944,12 +1953,12 @@ enum store_item_type do_store_item(item *it, int comm, conn *c) {
 
                 flags = (int) strtol(ITEM_suffix(old_it), (char **) NULL, 10);
 
-                new_it = do_item_alloc(key, it->nkey, flags, old_it->exptime, it->nbytes + old_it->nbytes - 2 /* CRLF */);
+                new_it = item_alloc(key, it->nkey, flags, old_it->exptime, it->nbytes + old_it->nbytes - 2 /* CRLF */);
 
                 if (new_it == NULL) {
                     /* SERVER_ERROR out of memory */
                     if (old_it != NULL)
-                        do_item_remove(old_it);
+                        item_remove(old_it);
 
                     return NOT_STORED;
                 }
@@ -1971,9 +1980,9 @@ enum store_item_type do_store_item(item *it, int comm, conn *c) {
 
         if (stored == NOT_STORED) {
             if (old_it != NULL)
-                item_replace(old_it, it);
+                item_replace(old_it, it, 1);
             else
-                do_item_link(it);
+                item_link(it);
 
             c->cas = ITEM_get_cas(it);
 
@@ -1982,9 +1991,9 @@ enum store_item_type do_store_item(item *it, int comm, conn *c) {
     }
 
     if (old_it != NULL)
-        do_item_remove(old_it);         /* release our reference */
+        item_remove(old_it);         /* release our reference */
     if (new_it != NULL)
-        do_item_remove(new_it);
+        item_remove(new_it);
 
     return stored;
 }
@@ -2640,14 +2649,14 @@ enum delta_result_type do_add_delta(conn *c, item *it, const bool incr,
     res = strlen(buf);
     if (res + 2 > it->nbytes) { /* need to realloc */
         item *new_it;
-        new_it = do_item_alloc(ITEM_key(it), it->nkey, atoi(ITEM_suffix(it) + 1), it->exptime, res + 2 );
+        new_it = item_alloc(ITEM_key(it), it->nkey, atoi(ITEM_suffix(it) + 1), it->exptime, res + 2 );
         if (new_it == 0) {
             return EOM;
         }
         memcpy(ITEM_data(new_it), buf, res);
         memcpy(ITEM_data(new_it) + res, "\r\n", 2);
-        item_replace(it, new_it);
-        do_item_remove(new_it);       /* release our reference */
+        item_replace(it, new_it, 0);
+        item_remove(new_it);       /* release our reference */
     } else { /* replace in-place */
         /* When changing the value without replacing the item, we
            need to update the CAS on the existing item. */
@@ -2658,6 +2667,14 @@ enum delta_result_type do_add_delta(conn *c, item *it, const bool incr,
     }
 
     return OK;
+}
+
+enum delta_result_type add_delta(conn *c, item *it, const int incr, const int64_t delta, char *buf) {
+    enum delta_result_type ret;
+    pthread_mutex_lock(&delta_lock);
+    ret = do_add_delta(c, it, incr, delta, buf);
+    pthread_mutex_unlock(&delta_lock);
+    return ret;
 }
 
 static void process_delete_command(conn *c, token_t *tokens, const size_t ntokens) {
@@ -3116,7 +3133,7 @@ void do_accept_new_conns(const bool do_accept) {
     } else {
         STATS_LOCK();
         stats.accepting_conns = false;
-        stats.listen_disabled_num++;
+        atomic_inc(&stats.listen_disabled_num);
         STATS_UNLOCK();
     }
 }
@@ -4391,3 +4408,30 @@ int main (int argc, char **argv) {
 
     return EXIT_SUCCESS;
 }
+
+// Emulate somehow 64 bit atomic operations on 32 bit machines
+// TODO this assumes little endian
+#if defined(HAVE_SYNC_BUILTINS) && !defined(HAVE_SYNC_BUILTINS_64)
+uint64_t __sync_add_and_fetch_8(uint64_t* v, uint64_t x) {
+	uint32_t* low = (uint32_t*)v;
+	uint32_t low_old, low_new;
+	low_new = atomic_add(low, (uint32_t)x);
+	low_old = low_new - x;
+	if (low_new < low_old) {
+		uint32_t* high = ((uint32_t*)v) + 1;
+		atomic_inc(high);
+	}
+	return *v;
+}
+uint64_t __sync_sub_and_fetch_8(uint64_t* v, uint64_t x) {
+	uint32_t* low = (uint32_t*)v;
+	uint32_t low_old, low_new;
+	low_new = atomic_sub(low, (uint32_t)x);
+	low_old = low_new + x;
+	if (low_new > low_old) {
+		uint32_t* high = ((uint32_t*)v) + 1;
+		atomic_dec(high);
+	}
+	return *v;
+}
+#endif
